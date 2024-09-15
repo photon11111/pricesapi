@@ -1,75 +1,147 @@
 package main
 
 import (
+	"context"
 	"net/http"
 	"os"
+	"os/signal"
 	"pricesapi/internal/api"
+	"pricesapi/internal/db"
+	"syscall"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/joho/godotenv"
 	log "github.com/sirupsen/logrus"
 )
 
-func main() {
-	err := godotenv.Load()
+func getEnv(key, defaultValue string) string {
+	value := os.Getenv(key)
+	if value == "" {
+		value = defaultValue
+		log.Warn("%s not set, using default: %s", key, defaultValue)
+	}
 
+	return value
+}
+
+func updatePrices(currencies []string, quotedCurrency string,) {
+	for _, currency := range currencies {
+		price, err := api.GetPriceFromBinance(currency, quotedCurrency)
+		if err != nil {
+			log.WithFields(log.Fields{
+				"currency": currency,
+				"error":    err,
+			}).Error("Failed to get price from Binance")
+			continue
+		}
+
+		err = db.SaveInstrumentInfoToDB(db.InstrumentInfo{
+			UpdateTime:       time.Now(),
+			Instrument:       currency,
+			Price:            price,
+			QuotedInstrument: quotedCurrency,
+		})
+
+		if err != nil {
+			log.WithFields(log.Fields{
+				"currency": currency,
+				"error":    err,
+			}).Error("Failed to save currency information to database")
+		}
+	}
+}
+
+func handlePriceRequest(c *gin.Context) {
+	currency := c.Query("currency")
+	if currency == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "wrong query parameters"})
+		return
+	}
+
+	curInfo, err := db.GetInstrumentInfoFromDB(currency, "USDT")
 	if err != nil {
-		log.Error("error of .env file loading")
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
 
-	port := os.Getenv("PORT")
+	c.JSON(http.StatusOK, gin.H{
+		"base_currency":   curInfo.Instrument,
+		"quoted_currency": curInfo.QuotedInstrument,
+		"price":           curInfo.Price,
+		"update_time":     curInfo.UpdateTime,
+	})
+}
 
-	if port == "" {
-		log.Error("port wasn't specified")
-		return
+func main() {
+	if err := godotenv.Load(); err != nil {
+		log.WithError(err).Warn("Failed to load .env file")
 	}
+
+	quotedCurrency := getEnv("QUOTED_CURRENCY", "USDT")
+
+	port := getEnv("PORT", "8080")
+
+	currencies := []string{"BTC", "ETH", "BNB", "SOL", "TON", "TRX", "DOGE", "ADA", "AVAX"}
+
+	if err := db.OpenDB(); err != nil {
+		log.WithError(err).Fatal("Failed to open database")
+	}
+	defer db.CloseDB()
 
 	r := gin.Default()
+	r.GET("/price/binance", handlePriceRequest)
 
-	r.GET("/price/coingecko", func(c *gin.Context) {
-		currency := c.Query("currency")
-		in := c.Query("in")
+	srv := &http.Server{
+		Addr:    ":" + port,
+		Handler: r,
+	}
 
-		if currency == "" || in == "" {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "wrong query parameters"})
-			return
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func (ctx context.Context, interval time.Duration, currencies []string, quotedCurrency string) {
+		updatePrices(currencies, quotedCurrency)
+	
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+	
+		for {
+			select {
+			case <-ctx.Done():
+				log.Info("Price update stopped")
+				return
+			case <-ticker.C:
+				updatePrices(currencies, quotedCurrency)
+			}
 		}
+	}(ctx, 1*time.Hour, currencies, quotedCurrency)
 
-		price, err := api.GetPriceFromCoingecko(currency, in)
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-			return
+
+	startedCh := make(chan bool, 1)
+	go func() {
+		startedCh <- true
+
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.WithError(err).Fatal("Server encountered an error")
 		}
+	}()
 
-		c.JSON(http.StatusOK, gin.H{
-			"base_currency":   currency,
-			"quoted_currency": in,
-			"price":           price,
-		})
-	})
+	<-startedCh
+	log.Info("Listening and serve at :", port)
 
-	r.GET("/price/binance", func(c *gin.Context) {
-		currency := c.Query("currency")
-		in := c.Query("in")
+	<-quit
+	log.Info("Shutting down server...")
 
-		if currency == "" || in == "" {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "wrong query parameters"})
-			return
-		}
+	cancel()
 
-		price, err := api.GetPriceFromBinance(currency, in)
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-			return
-		}
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer shutdownCancel()
 
-		c.JSON(http.StatusOK, gin.H{
-			"base_currency":   currency,
-			"quoted_currency": in,
-			"price":           price,
-		})
-	})
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		log.WithError(err).Fatal("Server forced to shutdown")
+	}
 
-	r.Run(":" + port)
+	log.Info("Server shut down gracefully")
 }

@@ -1,0 +1,18 @@
+version: '3.8'
+services:
+  cockroachdb:
+    image: cockroachdb/cockroach:v23.1.0
+    container_name: db_container
+    command: ["start-single-node", "--insecure"]
+    ports:
+      - "26257:26257"
+    volumes:
+      - cockroach-data:/cockroach/cockroach-data
+    networks:
+      - cockroach-network
+
+volumes:
+  cockroach-data:
+
+networks:
+  cockroach-network:
