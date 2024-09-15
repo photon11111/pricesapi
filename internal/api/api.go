@@ -28,12 +28,12 @@ func GetPriceFromBinance(baseCurrency string, quotedCurrency string) (float64, e
 		return 0, fmt.Errorf("Binance API returned non-200 status: %s", resp.Status)
 	}
 
-	var priceResp binanceResponse
-	if err := json.NewDecoder(resp.Body).Decode(&priceResp); err != nil {
+	var binanceResp binanceResponse
+	if err := json.NewDecoder(resp.Body).Decode(&binanceResp); err != nil {
 		return 0, fmt.Errorf("error decoding response from Binance API: %w", err)
 	}
 
-	price, err := strconv.ParseFloat(priceResp.Price, 64)
+	price, err := strconv.ParseFloat(binanceResp.Price, 64)
 	if err != nil {
 		return 0, fmt.Errorf("error converting price to float64: %w", err)
 	}
